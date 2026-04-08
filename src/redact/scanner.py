@@ -2,6 +2,10 @@
 
 Searches PDF pages for specified terms and returns match locations
 with bounding rectangles for redaction.
+
+Smart term expansion automatically generates separator variants,
+suffix searches, and mask-stripped forms so the user only needs
+to write each sensitive number once.
 """
 
 from __future__ import annotations
@@ -11,6 +15,15 @@ import re
 from pathlib import Path
 
 import fitz  # PyMuPDF
+
+# Characters treated as separators between digit groups
+_SEPARATORS = re.compile(r"[-\s.]+")
+
+# Characters treated as masking in partially-redacted numbers
+_MASK_CHARS = re.compile(r"^[*Xx.·•]+")
+
+# A term that contains at least one digit mixed with separators
+_HAS_DIGIT_WITH_SEP = re.compile(r"\d.*[-\s.]+.*\d|\d{2,}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,6 +68,104 @@ def load_terms(terms_path: Path) -> list[str]:
     return terms
 
 
+def _extract_digits(s: str) -> str:
+    """Extract only digit characters from a string."""
+    return "".join(c for c in s if c.isdigit())
+
+
+def _extract_digit_groups(s: str) -> list[str]:
+    """Extract groups of consecutive digits from a string."""
+    return re.findall(r"\d+", s)
+
+
+def _strip_mask(s: str) -> str | None:
+    """If a term has leading mask characters before digits, extract the digits.
+
+    Examples:
+        "***-**-6789"    → "6789"
+        "XXXX1234"       → "1234"
+        "****-****-1234" → "1234"
+        "....5678"       → "5678"
+        "John Smith"     → None (no mask pattern)
+    """
+    # Remove dashes and spaces (but NOT dots — dots can be mask chars)
+    cleaned = re.sub(r"[-\s]+", "", s)
+    # Check if it starts with mask characters followed by digits
+    mask_match = _MASK_CHARS.match(cleaned)
+    if not mask_match:
+        return None
+    remainder = cleaned[mask_match.end():]
+    if remainder and remainder.isdigit() and len(remainder) >= 3:
+        return remainder
+    return None
+
+
+def expand_term(term: str) -> list[str]:
+    """Expand a single term into all search variants.
+
+    Rules:
+    1. Separator variants — for terms with digits + separators,
+       generate forms with dashes, spaces, dots, and no separators.
+    2. Suffix search — for digit sequences >= 6 digits, also
+       search for the last 4 and last 5 digits.
+    3. Mask stripping — if term has mask characters (*, X, x)
+       before digits, extract the digit portion.
+
+    Non-numeric terms (names, addresses) pass through unchanged.
+    """
+    variants: list[str] = [term]
+
+    # Rule 3: Mask stripping — extract digits from masked terms
+    stripped = _strip_mask(term)
+    if stripped:
+        # For a masked term like "***-**-6789", the meaningful part
+        # is just the digits. Expand those digits instead.
+        variants.append(stripped)
+        # Also apply separator variants to the extracted digits
+        # if they're long enough to have groups
+        digits = stripped
+    else:
+        digits = _extract_digits(term)
+
+    groups = _extract_digit_groups(term)
+    has_separators = bool(groups) and len(groups) > 1
+
+    # Rule 1: Separator variants
+    if has_separators and digits:
+        # Generate variants preserving the original grouping pattern
+        variants.append(digits)                           # no separators
+        variants.append("-".join(groups))                 # dashes
+        variants.append(" ".join(groups))                 # spaces
+        variants.append(".".join(groups))                 # dots
+    elif digits and len(digits) >= 2 and not has_separators:
+        # Pure digit sequence or term with digits but no sep groups
+        # Still add it as-is (already in variants)
+        pass
+
+    # Rule 2: Suffix search for partial masking
+    if len(digits) >= 6:
+        last4 = digits[-4:]
+        last5 = digits[-5:]
+        variants.append(last4)
+        variants.append(last5)
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for v in variants:
+        v_stripped = v.strip()
+        if v_stripped and v_stripped not in seen:
+            seen.add(v_stripped)
+            unique.append(v_stripped)
+
+    return unique
+
+
+def expand_terms(terms: list[str]) -> dict[str, list[str]]:
+    """Expand all terms and return a mapping of original → variants."""
+    return {term: expand_term(term) for term in terms}
+
+
 def _check_fonts(page: fitz.Page) -> list[FontWarning]:
     """Check for fonts that may prevent reliable text extraction."""
     warnings: list[FontWarning] = []
@@ -74,8 +185,6 @@ def _check_fonts(page: fitz.Page) -> list[FontWarning]:
             ))
 
         if encoding and "Identity" in str(encoding):
-            # Identity encoding without a ToUnicode CMap can cause
-            # search failures. We flag it as a warning.
             warnings.append(FontWarning(
                 page_number=page.number,
                 font_name=font_name,
@@ -87,10 +196,7 @@ def _check_fonts(page: fitz.Page) -> list[FontWarning]:
 
 
 def _check_text_vs_images(page: fitz.Page) -> FontWarning | None:
-    """Warn if a page has images but little/no extractable text.
-
-    This suggests the page is scanned/image-based.
-    """
+    """Warn if a page has images but little/no extractable text."""
     text = page.get_text("text").strip()
     images = page.get_images(full=True)
 
@@ -104,15 +210,81 @@ def _check_text_vs_images(page: fitz.Page) -> FontWarning | None:
     return None
 
 
+def _check_line_breaks(
+    page: fitz.Page,
+    term: str,
+    digits: str,
+    already_found: bool,
+) -> FontWarning | None:
+    """Check if a digit sequence appears in collapsed page text
+    but was not found by the standard search (suggesting a line break).
+    """
+    if not digits or len(digits) < 6 or already_found:
+        return None
+
+    # Extract text, collapse whitespace
+    raw_text = page.get_text("text")
+    collapsed = re.sub(r"\s+", "", raw_text)
+
+    if digits in collapsed:
+        return FontWarning(
+            page_number=page.number,
+            font_name="N/A",
+            reason=f"A search term appears on this page but may be split "
+                   f"across lines. Manual review recommended.",
+        )
+    return None
+
+
+def _deduplicate_rects(rects: list[fitz.Rect]) -> list[fitz.Rect]:
+    """Remove rects that are contained within or nearly overlap a larger rect.
+
+    When a suffix variant (e.g., "6789") matches inside the same text
+    that the full variant (e.g., "123-45-6789") also matched, we get
+    two rects — one large, one small. We keep only the larger one.
+
+    Two rects on the same horizontal line are considered overlapping
+    if one's x-range is within the other's (with a small tolerance).
+    """
+    if not rects:
+        return []
+
+    # Sort by width descending so we check large rects first
+    sorted_rects = sorted(rects, key=lambda r: r.width, reverse=True)
+    kept: list[fitz.Rect] = []
+    tolerance = 2.0  # points
+
+    for rect in sorted_rects:
+        is_contained = False
+        for existing in kept:
+            # Check if rect is on the same line and within the x-range
+            same_line = (
+                abs(rect.y0 - existing.y0) < tolerance
+                and abs(rect.y1 - existing.y1) < tolerance
+            )
+            x_contained = (
+                rect.x0 >= existing.x0 - tolerance
+                and rect.x1 <= existing.x1 + tolerance
+            )
+            if same_line and x_contained:
+                is_contained = True
+                break
+        if not is_contained:
+            kept.append(rect)
+
+    return kept
+
+
 def scan_pdf(pdf_path: Path, terms: list[str]) -> ScanResult:
     """Scan a PDF for all occurrences of the given terms.
 
-    Uses PyMuPDF's search_for() which returns bounding rectangles
-    for each match. Also performs font analysis to warn about
-    edge cases where text extraction may be unreliable.
+    Each term is automatically expanded into separator variants,
+    suffix forms, and mask-stripped forms before searching.
+    Uses PyMuPDF's search_for() which returns bounding rectangles.
     """
-    # Reduce line-height overlap issues in bounding boxes
     fitz.TOOLS.set_small_glyph_heights(True)
+
+    expansion_map = expand_terms(terms)
 
     doc = fitz.open(str(pdf_path))
     try:
@@ -120,23 +292,41 @@ def scan_pdf(pdf_path: Path, terms: list[str]) -> ScanResult:
         all_warnings: list[FontWarning] = []
 
         for page in doc:
-            # Font analysis
             all_warnings.extend(_check_fonts(page))
 
-            # Scanned page detection
             img_warning = _check_text_vs_images(page)
             if img_warning:
                 all_warnings.append(img_warning)
 
-            # Search for each term
-            for term in terms:
-                rects = page.search_for(term)
-                for rect in rects:
+            for original_term, variants in expansion_map.items():
+                found_any = False
+                # Collect all rects found by all variants for this term
+                # on this page, then deduplicate by overlap.
+                page_rects: list[fitz.Rect] = []
+                for variant in variants:
+                    rects = page.search_for(variant)
+                    page_rects.extend(rects)
+
+                # Deduplicate: drop rects that are contained within
+                # a larger rect (suffix match inside a full match).
+                # Keep the largest non-overlapping set.
+                deduped = _deduplicate_rects(page_rects)
+
+                for rect in deduped:
                     all_matches.append(Match(
-                        term=term,
+                        term=original_term,
                         page_number=page.number,
                         rect=(rect.x0, rect.y0, rect.x1, rect.y1),
                     ))
+                    found_any = True
+
+                # Line break detection
+                digits = _extract_digits(original_term)
+                lb_warning = _check_line_breaks(
+                    page, original_term, digits, found_any,
+                )
+                if lb_warning:
+                    all_warnings.append(lb_warning)
 
         return ScanResult(
             matches=all_matches,
