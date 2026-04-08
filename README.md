@@ -69,6 +69,49 @@ Three-level verification runs automatically:
 
 If any check fails, you'll know.
 
+## Bulk mode — process a whole folder
+
+Got a stack of documents? Drop them in a folder and redact them all at once.
+
+```bash
+# Step 1: Scan everything
+redact bulk scan ./input --terms terms.txt --drafts ./drafts
+
+# Step 2: Browse the drafts/ folder, check the highlighted previews
+# Step 3: Apply everything
+redact bulk apply bulk_manifest.json --output ./output
+```
+
+```
+$ redact bulk scan ./input --terms terms.txt
+
+Scanning 3 PDF(s) in ./input for 3 term(s)...
+
+            Bulk Scan Results
+┏━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━┓
+┃ File              ┃ Matches ┃ Pages affected ┃
+┡━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━━┩
+│ tax_return.pdf    │       3 │              1 │
+│ w2_form.pdf       │       1 │              1 │
+└───────────────────┴─────────┴────────────────┘
+
+2 file(s) with matches, 1 clean, 4 total redactions
+
+Drafts:   ./drafts
+Manifest: bulk_manifest.json
+```
+
+The folder layout:
+
+```
+input/              ← your original PDFs (never modified)
+drafts/             ← highlighted previews for review
+output/             ← final redacted PDFs
+bulk_manifest.json  ← tracks everything between phases
+```
+
+Files with no matches are skipped automatically. Corrupt or unreadable PDFs are reported and skipped without stopping the batch. Each file gets its own SHA-256 integrity check — if a source file changes between scan and apply, that file is skipped and the rest continue.
+
 ## The terms file
 
 One term per line. Comments and blank lines are fine.

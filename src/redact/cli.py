@@ -1,8 +1,10 @@
 """CLI entry point for the redact tool.
 
-Two subcommands:
-  redact scan  — find matches, generate preview + manifest
-  redact apply — apply redactions from a manifest
+Subcommands:
+  redact scan       — scan a single PDF, generate preview + manifest
+  redact apply      — apply redactions from a manifest
+  redact bulk scan  — scan a folder of PDFs
+  redact bulk apply — apply redactions for an entire folder
 
 Security safeguards applied at startup:
   - Core dumps disabled
@@ -22,6 +24,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from redact.bulk import bulk_apply, bulk_scan, discover_pdfs, read_bulk_manifest
 from redact.manifest import (
     compute_file_hash,
     create_manifest,
@@ -306,6 +309,214 @@ def apply_cmd(
             )
 
     console.print(f"\nSaved to: [blue bold]{output}[/blue bold]")
+
+
+bulk_app = typer.Typer(
+    name="bulk",
+    help="Process a folder of PDFs at once.",
+    no_args_is_help=True,
+)
+app.add_typer(bulk_app, name="bulk")
+
+
+@bulk_app.command(name="scan")
+def bulk_scan_cmd(
+    input_dir: Annotated[
+        Path,
+        typer.Argument(
+            help="Folder containing PDF files to scan.",
+            exists=True,
+            file_okay=False,
+            readable=True,
+        ),
+    ],
+    terms_file: Annotated[
+        Path,
+        typer.Option(
+            "--terms", "-t",
+            help="File containing search terms, one per line.",
+            exists=True,
+            readable=True,
+        ),
+    ],
+    drafts_dir: Annotated[
+        Path,
+        typer.Option(
+            "--drafts", "-d",
+            help="Folder for preview PDFs with highlights.",
+        ),
+    ] = Path("drafts"),
+    manifest_out: Annotated[
+        Path,
+        typer.Option(
+            "--output", "-o",
+            help="Path for the bulk manifest JSON file.",
+        ),
+    ] = Path("bulk_manifest.json"),
+) -> None:
+    """Scan all PDFs in a folder and generate previews for review.
+
+    Creates a drafts/ folder with highlighted preview PDFs and a
+    bulk manifest that tracks all files and matches.
+    """
+    _apply_security_safeguards()
+    _block_spotlight(drafts_dir.resolve())
+
+    terms = load_terms(terms_file)
+    if not terms:
+        console.print("[red]Error:[/red] No search terms found in terms file.")
+        raise typer.Exit(code=1)
+
+    pdfs = discover_pdfs(input_dir)
+    if not pdfs:
+        console.print(
+            f"[yellow]No PDF files found in [bold]{input_dir}[/bold].[/yellow]"
+        )
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"Scanning [bold]{len(pdfs)}[/bold] PDF(s) in "
+        f"[blue]{input_dir}[/blue] for {len(terms)} term(s)...\n"
+    )
+
+    manifest, summary = bulk_scan(input_dir, terms, drafts_dir, manifest_out)
+
+    # Results table
+    table = Table(title="Bulk Scan Results")
+    table.add_column("File", style="bold")
+    table.add_column("Matches", justify="right")
+    table.add_column("Pages affected", justify="right")
+
+    for fm in manifest.get("files", []):
+        stats = fm.get("statistics", {})
+        name = Path(fm["source_pdf"]).name
+        matches = stats.get("total_matches", 0)
+        pages = len(stats.get("pages_affected", []))
+        table.add_row(name, str(matches), str(pages))
+
+    console.print(table)
+
+    console.print(
+        f"\n[bold]{summary.files_with_matches}[/bold] file(s) with matches, "
+        f"[bold]{summary.files_without_matches}[/bold] clean, "
+        f"[bold]{summary.total_matches}[/bold] total redactions"
+    )
+
+    if summary.files_skipped:
+        console.print(
+            f"\n[yellow]Skipped {len(summary.files_skipped)} file(s) "
+            f"(could not read): {', '.join(summary.files_skipped)}[/yellow]"
+        )
+
+    if summary.files_with_matches == 0:
+        console.print(
+            "\n[yellow]No matches found in any file.[/yellow]"
+        )
+        raise typer.Exit(code=1)
+
+    console.print(f"\nDrafts:   [blue]{drafts_dir}[/blue]")
+    console.print(f"Manifest: [blue]{manifest_out}[/blue]")
+    console.print(
+        "\n[green]Review the previews in the drafts folder, then run "
+        "[bold]redact bulk apply[/bold] to apply redactions.[/green]"
+    )
+
+
+@bulk_app.command(name="apply")
+def bulk_apply_cmd(
+    manifest_path: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to the bulk manifest JSON from the scan phase.",
+            exists=True,
+            readable=True,
+        ),
+    ],
+    output_dir: Annotated[
+        Path,
+        typer.Option(
+            "--output", "-o",
+            help="Folder for redacted PDF output.",
+        ),
+    ] = Path("output"),
+) -> None:
+    """Apply redactions for all files in a bulk manifest.
+
+    Reads the bulk manifest from `redact bulk scan`, applies true
+    redactions to every file, and saves results to the output folder.
+    """
+    _apply_security_safeguards()
+    _block_spotlight(output_dir.resolve())
+
+    manifest = read_bulk_manifest(manifest_path)
+    file_count = len(manifest["files"])
+
+    if file_count == 0:
+        console.print("[yellow]No files to process in this manifest.[/yellow]")
+        raise typer.Exit(code=0)
+
+    console.print(
+        f"Applying redactions for [bold]{file_count}[/bold] file(s)...\n"
+    )
+
+    results = bulk_apply(manifest, output_dir)
+
+    # Strip xattrs from all output files
+    for r in results:
+        if r["status"] == "done":
+            _strip_xattrs(Path(r["output"]))
+
+    # Results table
+    table = Table(title="Bulk Apply Results")
+    table.add_column("File", style="bold")
+    table.add_column("Redactions", justify="right")
+    table.add_column("Status")
+    table.add_column("Verification")
+
+    for r in results:
+        status_style = {
+            "done": "green",
+            "skipped": "yellow",
+            "error": "red",
+        }.get(r["status"], "white")
+
+        verification = r.get("verification", "—")
+        ver_style = "green" if verification == "passed" else "red" if "FAIL" in str(verification) else "dim"
+
+        table.add_row(
+            r["source"],
+            str(r["matches"]),
+            f"[{status_style}]{r['status']}[/{status_style}]",
+            f"[{ver_style}]{verification}[/{ver_style}]",
+        )
+
+    console.print(table)
+
+    done = sum(1 for r in results if r["status"] == "done")
+    skipped = sum(1 for r in results if r["status"] == "skipped")
+    errors = sum(1 for r in results if r["status"] == "error")
+    failed_ver = sum(1 for r in results if r.get("verification") == "FAILED")
+
+    console.print(
+        f"\n[bold]{done}[/bold] completed, "
+        f"[bold]{skipped}[/bold] skipped, "
+        f"[bold]{errors}[/bold] errors"
+    )
+
+    if failed_ver > 0:
+        console.print(
+            f"\n[red bold]{failed_ver} file(s) failed verification. "
+            f"Review manually before distributing.[/red bold]"
+        )
+
+    if errors > 0:
+        for r in results:
+            if r["status"] == "error":
+                console.print(
+                    f"  [red]{r['source']}: {r.get('reason', 'unknown error')}[/red]"
+                )
+
+    console.print(f"\nOutput: [blue bold]{output_dir}[/blue bold]")
 
 
 if __name__ == "__main__":
