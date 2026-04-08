@@ -57,3 +57,28 @@ def test_verify_multipage(tmp_path: Path, pdf_multipage: Path):
 
     vr = verify_redaction(output, terms)
     assert vr.passed is True
+
+
+def test_verify_catches_case_variants(pdf_with_ssn: Path):
+    """Verification should detect text regardless of case in the term."""
+    # PDF contains "John Smith" — verify with different cases
+    vr_lower = verify_redaction(pdf_with_ssn, ["john smith"])
+    vr_upper = verify_redaction(pdf_with_ssn, ["JOHN SMITH"])
+
+    assert vr_lower.passed is False
+    assert vr_upper.passed is False
+
+
+def test_verify_passes_case_insensitive_after_redaction(
+    tmp_path: Path, pdf_with_ssn: Path
+):
+    """After redacting with one case, verification with any case should pass."""
+    # Scan with lowercase, redact, then verify with uppercase
+    result = scan_pdf(pdf_with_ssn, ["john smith"])
+    manifest = create_manifest(result, pdf_with_ssn)
+
+    output = tmp_path / "redacted.pdf"
+    apply_redactions(pdf_with_ssn, manifest["matches"], output)
+
+    vr = verify_redaction(output, ["JOHN SMITH"])
+    assert vr.passed is True

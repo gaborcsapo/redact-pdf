@@ -75,3 +75,15 @@ def test_scan_terms_searched_tracked(pdf_with_ssn: Path):
     terms = ["term1", "term2"]
     result = scan_pdf(pdf_with_ssn, terms)
     assert result.terms_searched == terms
+
+
+def test_scan_case_insensitive(pdf_with_ssn: Path):
+    """Search terms should match regardless of case."""
+    # PDF contains "John Smith" — searching with different cases should match
+    result_lower = scan_pdf(pdf_with_ssn, ["john smith"])
+    result_upper = scan_pdf(pdf_with_ssn, ["JOHN SMITH"])
+    result_mixed = scan_pdf(pdf_with_ssn, ["jOhN sMiTh"])
+
+    assert len(result_lower.matches) == 1
+    assert len(result_upper.matches) == 1
+    assert len(result_mixed.matches) == 1

@@ -186,3 +186,22 @@ def test_redaction_output_is_new_file(
     # Output should be a different file
     assert output != pdf_with_ssn
     assert output.exists()
+
+
+def test_redaction_case_insensitive(tmp_path: Path, pdf_with_ssn: Path):
+    """Searching with different case should still redact the text."""
+    # PDF contains "John Smith" — search with lowercase
+    result = scan_pdf(pdf_with_ssn, ["john smith"])
+    assert len(result.matches) == 1
+
+    manifest = create_manifest(result, pdf_with_ssn)
+    output = tmp_path / "redacted.pdf"
+    apply_redactions(pdf_with_ssn, manifest["matches"], output)
+
+    doc = fitz.open(str(output))
+    text = doc[0].get_text("text")
+    doc.close()
+
+    # "John Smith" should be gone regardless of search case
+    assert "John Smith" not in text
+    assert "john smith" not in text.lower()

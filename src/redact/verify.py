@@ -66,14 +66,16 @@ def _check_content_streams(pdf_path: Path, terms: list[str]) -> list[str]:
                         raw = bytes(stream.read_bytes())
                     except Exception:
                         continue
+                    raw_lower = raw.lower()
                     for term in terms:
                         # Check for the term in various encodings
+                        # (case-insensitive via lowering both sides)
                         for encoding in ("utf-8", "latin-1", "utf-16-be"):
                             try:
-                                encoded = term.encode(encoding)
+                                encoded = term.lower().encode(encoding)
                             except (UnicodeEncodeError, UnicodeDecodeError):
                                 continue
-                            if encoded in raw:
+                            if encoded in raw_lower:
                                 failures.append(
                                     f"Stream inspection: term found in "
                                     f"content stream on page {page_num + 1}"
@@ -93,13 +95,14 @@ def _check_full_bytes(pdf_path: Path, terms: list[str]) -> list[str]:
     """
     failures = []
     raw = pdf_path.read_bytes()
+    raw_lower = raw.lower()
     for term in terms:
         for encoding in ("utf-8", "latin-1", "utf-16-be"):
             try:
-                encoded = term.encode(encoding)
+                encoded = term.lower().encode(encoding)
             except (UnicodeEncodeError, UnicodeDecodeError):
                 continue
-            if encoded in raw:
+            if encoded in raw_lower:
                 failures.append(
                     f"Byte scan: term found in raw file data "
                     f"({encoding} encoding)"
