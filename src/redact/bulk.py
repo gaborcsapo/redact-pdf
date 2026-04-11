@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -178,7 +179,17 @@ def bulk_apply(
         }
 
         # Verify source hasn't changed
-        current_hash = compute_file_hash(source_pdf)
+        try:
+            current_hash = compute_file_hash(source_pdf)
+        except Exception as e:
+            result_entry["status"] = "error"
+            result_entry["phase"] = "hash"
+            result_entry["error_type"] = type(e).__name__
+            result_entry["error_message"] = str(e)
+            result_entry["traceback"] = traceback.format_exc()
+            results.append(result_entry)
+            continue
+
         if current_hash != file_manifest["source_pdf_sha256"]:
             result_entry["status"] = "skipped"
             result_entry["reason"] = "source PDF changed since scanning"
@@ -191,10 +202,20 @@ def bulk_apply(
             results.append(result_entry)
             continue
 
+        # Phase 1: apply redactions
         try:
             apply_redactions(source_pdf, file_manifest["matches"], output_path)
+        except Exception as e:
+            result_entry["status"] = "error"
+            result_entry["phase"] = "redact"
+            result_entry["error_type"] = type(e).__name__
+            result_entry["error_message"] = str(e)
+            result_entry["traceback"] = traceback.format_exc()
+            results.append(result_entry)
+            continue
 
-            # Verify
+        # Phase 2: verify
+        try:
             terms = file_manifest.get("terms", manifest.get("terms", []))
             if terms:
                 vr = verify_redaction(output_path, terms)
@@ -208,8 +229,10 @@ def bulk_apply(
 
         except Exception as e:
             result_entry["status"] = "error"
-            result_entry["reason"] = type(e).__name__
-            # Never include exception message — it could contain file content
+            result_entry["phase"] = "verify"
+            result_entry["error_type"] = type(e).__name__
+            result_entry["error_message"] = str(e)
+            result_entry["traceback"] = traceback.format_exc()
 
         results.append(result_entry)
 

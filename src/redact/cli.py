@@ -439,6 +439,20 @@ def bulk_apply_cmd(
             help="Folder for redacted PDF output.",
         ),
     ] = Path("output"),
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose", "-v",
+            help="Show full tracebacks for errors.",
+        ),
+    ] = False,
+    error_log: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--error-log",
+            help="Write detailed errors (with tracebacks) to this file.",
+        ),
+    ] = None,
 ) -> None:
     """Apply redactions for all files in a bulk manifest.
 
@@ -509,14 +523,65 @@ def bulk_apply_cmd(
             f"Review manually before distributing.[/red bold]"
         )
 
+    # Print detailed error info for each failed file
     if errors > 0:
+        console.print("\n[red bold]Error details:[/red bold]")
         for r in results:
-            if r["status"] == "error":
-                console.print(
-                    f"  [red]{r['source']}: {r.get('reason', 'unknown error')}[/red]"
-                )
+            if r["status"] != "error":
+                continue
+            phase = r.get("phase", "unknown")
+            err_type = r.get("error_type", "UnknownError")
+            err_msg = r.get("error_message", "")
+            console.print(
+                f"  [red]{r['source']}[/red] "
+                f"[dim](phase: {phase})[/dim]"
+            )
+            console.print(f"    [red]{err_type}:[/red] {err_msg}")
+            if verbose and r.get("traceback"):
+                # Indent the traceback for readability
+                tb_lines = r["traceback"].rstrip().splitlines()
+                for line in tb_lines:
+                    console.print(f"    [dim]{line}[/dim]")
+
+        if not verbose:
+            console.print(
+                "\n[dim]Tip: re-run with [bold]--verbose[/bold] for full "
+                "tracebacks, or [bold]--error-log errors.log[/bold] to save "
+                "them to a file.[/dim]"
+            )
+
+    # Write error log file if requested
+    if error_log and errors > 0:
+        _write_error_log(results, error_log)
+        console.print(f"\nError log written to: [blue]{error_log}[/blue]")
 
     console.print(f"\nOutput: [blue bold]{output_dir}[/blue bold]")
+
+
+def _write_error_log(results: list[dict], log_path: Path) -> None:
+    """Write a detailed error log with tracebacks for all failed files."""
+    lines: list[str] = []
+    lines.append(f"Redact bulk apply — error log")
+    lines.append(f"Generated: {__import__('datetime').datetime.now().isoformat()}")
+    lines.append("=" * 70)
+    lines.append("")
+
+    error_count = 0
+    for r in results:
+        if r["status"] != "error":
+            continue
+        error_count += 1
+        lines.append(f"[{error_count}] {r['source']}")
+        lines.append(f"    Phase:       {r.get('phase', 'unknown')}")
+        lines.append(f"    Error type:  {r.get('error_type', 'UnknownError')}")
+        lines.append(f"    Error msg:   {r.get('error_message', '')}")
+        if r.get("traceback"):
+            lines.append("    Traceback:")
+            for tb_line in r["traceback"].rstrip().splitlines():
+                lines.append(f"      {tb_line}")
+        lines.append("")
+
+    log_path.write_text("\n".join(lines), encoding="utf-8")
 
 
 if __name__ == "__main__":

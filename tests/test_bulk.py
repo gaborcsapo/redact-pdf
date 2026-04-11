@@ -413,3 +413,181 @@ def test_bulk_apply_wrong_manifest_type(tmp_path: Path):
     ])
 
     assert result.exit_code == 1
+
+
+# --- Error reporting ---
+
+
+def test_bulk_apply_error_includes_phase_and_type(tmp_path: Path):
+    """When apply fails, result must include phase, error_type, and message."""
+    input_dir, terms_file = _make_input_folder(tmp_path)
+    terms = load_terms(terms_file)
+    drafts_dir = tmp_path / "drafts"
+    manifest_path = tmp_path / "manifest.json"
+
+    manifest, _ = bulk_scan(input_dir, terms, drafts_dir, manifest_path)
+
+    # Corrupt one source PDF after scanning so apply_redactions fails.
+    # Also update its hash in the manifest so the integrity check
+    # passes and we actually hit the apply_redactions error.
+    tax_pdf = input_dir / "tax_return.pdf"
+    tax_pdf.write_bytes(b"not a valid pdf at all")
+    # Update manifest hash to match the corrupt file
+    from redact.manifest import compute_file_hash
+    new_hash = compute_file_hash(tax_pdf)
+    for fm in manifest["files"]:
+        if fm["source_pdf"].endswith("tax_return.pdf"):
+            fm["source_pdf_sha256"] = new_hash
+
+    output_dir = tmp_path / "output"
+    results = bulk_apply(manifest, output_dir)
+
+    tax_result = next(r for r in results if r["source"] == "tax_return.pdf")
+    assert tax_result["status"] == "error"
+    assert "phase" in tax_result
+    assert tax_result["phase"] == "redact"
+    assert "error_type" in tax_result
+    assert "error_message" in tax_result
+    assert "traceback" in tax_result
+
+
+def test_bulk_apply_cli_shows_error_details(tmp_path: Path):
+    """CLI should display error type and message for failed files."""
+    input_dir, terms_file = _make_input_folder(tmp_path)
+    drafts_dir = tmp_path / "drafts"
+    manifest_path = tmp_path / "manifest.json"
+    output_dir = tmp_path / "output"
+
+    # Run scan
+    runner.invoke(app, [
+        "bulk", "scan",
+        str(input_dir),
+        "--terms", str(terms_file),
+        "--drafts", str(drafts_dir),
+        "--output", str(manifest_path),
+    ])
+
+    # Corrupt one file and update the manifest to match the new hash
+    tax_pdf = input_dir / "tax_return.pdf"
+    tax_pdf.write_bytes(b"not a valid pdf")
+
+    import json
+    from redact.manifest import compute_file_hash
+    manifest_data = json.loads(manifest_path.read_text())
+    new_hash = compute_file_hash(tax_pdf)
+    for fm in manifest_data["files"]:
+        if fm["source_pdf"].endswith("tax_return.pdf"):
+            fm["source_pdf_sha256"] = new_hash
+    manifest_path.write_text(json.dumps(manifest_data))
+
+    result = runner.invoke(app, [
+        "bulk", "apply",
+        str(manifest_path),
+        "--output", str(output_dir),
+    ])
+
+    # Output should show the error details section
+    assert "Error details" in result.output
+    assert "tax_return.pdf" in result.output
+    assert "phase:" in result.output
+    # Tip mentioning --verbose should appear
+    assert "--verbose" in result.output
+
+
+def test_bulk_apply_cli_verbose_shows_traceback(tmp_path: Path):
+    """--verbose flag should print full tracebacks for errors."""
+    input_dir, terms_file = _make_input_folder(tmp_path)
+    drafts_dir = tmp_path / "drafts"
+    manifest_path = tmp_path / "manifest.json"
+    output_dir = tmp_path / "output"
+
+    runner.invoke(app, [
+        "bulk", "scan",
+        str(input_dir),
+        "--terms", str(terms_file),
+        "--drafts", str(drafts_dir),
+        "--output", str(manifest_path),
+    ])
+
+    tax_pdf = input_dir / "tax_return.pdf"
+    tax_pdf.write_bytes(b"not a valid pdf")
+
+    import json
+    from redact.manifest import compute_file_hash
+    manifest_data = json.loads(manifest_path.read_text())
+    new_hash = compute_file_hash(tax_pdf)
+    for fm in manifest_data["files"]:
+        if fm["source_pdf"].endswith("tax_return.pdf"):
+            fm["source_pdf_sha256"] = new_hash
+    manifest_path.write_text(json.dumps(manifest_data))
+
+    result = runner.invoke(app, [
+        "bulk", "apply",
+        str(manifest_path),
+        "--output", str(output_dir),
+        "--verbose",
+    ])
+
+    # Traceback should appear in output
+    assert "Traceback" in result.output or "traceback" in result.output.lower()
+
+
+def test_bulk_apply_cli_writes_error_log(tmp_path: Path):
+    """--error-log should write detailed errors to a file."""
+    input_dir, terms_file = _make_input_folder(tmp_path)
+    drafts_dir = tmp_path / "drafts"
+    manifest_path = tmp_path / "manifest.json"
+    output_dir = tmp_path / "output"
+    log_path = tmp_path / "errors.log"
+
+    runner.invoke(app, [
+        "bulk", "scan",
+        str(input_dir),
+        "--terms", str(terms_file),
+        "--drafts", str(drafts_dir),
+        "--output", str(manifest_path),
+    ])
+
+    tax_pdf = input_dir / "tax_return.pdf"
+    tax_pdf.write_bytes(b"not a valid pdf")
+
+    import json
+    from redact.manifest import compute_file_hash
+    manifest_data = json.loads(manifest_path.read_text())
+    new_hash = compute_file_hash(tax_pdf)
+    for fm in manifest_data["files"]:
+        if fm["source_pdf"].endswith("tax_return.pdf"):
+            fm["source_pdf_sha256"] = new_hash
+    manifest_path.write_text(json.dumps(manifest_data))
+
+    result = runner.invoke(app, [
+        "bulk", "apply",
+        str(manifest_path),
+        "--output", str(output_dir),
+        "--error-log", str(log_path),
+    ])
+
+    assert log_path.exists()
+    log_content = log_path.read_text()
+    assert "tax_return.pdf" in log_content
+    assert "Traceback" in log_content
+    assert "Phase:" in log_content
+    assert "Error type:" in log_content
+
+
+def test_bulk_apply_successful_files_have_no_error_fields(tmp_path: Path):
+    """Successful files should not have phase/error_type/traceback fields."""
+    input_dir, terms_file = _make_input_folder(tmp_path)
+    terms = load_terms(terms_file)
+    drafts_dir = tmp_path / "drafts"
+    manifest_path = tmp_path / "manifest.json"
+    output_dir = tmp_path / "output"
+
+    manifest, _ = bulk_scan(input_dir, terms, drafts_dir, manifest_path)
+    results = bulk_apply(manifest, output_dir)
+
+    done = [r for r in results if r["status"] == "done"]
+    assert len(done) > 0
+    for r in done:
+        assert "error_type" not in r
+        assert "traceback" not in r
