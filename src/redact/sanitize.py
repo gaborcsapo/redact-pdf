@@ -69,12 +69,8 @@ def sanitize_metadata(pdf: pikepdf.Pdf) -> None:
         del pdf.Root["/OpenAction"]
     if "/AA" in pdf.Root:
         del pdf.Root["/AA"]
-    if "/Names" in pdf.Root:
-        names = pdf.Root["/Names"]
-        if "/JavaScript" in names:
-            del names["/JavaScript"]
-        if "/EmbeddedFiles" in names:
-            del names["/EmbeddedFiles"]
+    # Note: /Names tree (JavaScript, EmbeddedFiles, Dests) is deleted
+    # entirely in section 11d below.
 
     # 9. AcroForm (form fields with pre-filled data)
     if "/AcroForm" in pdf.Root:
@@ -87,6 +83,25 @@ def sanitize_metadata(pdf: pikepdf.Pdf) -> None:
     # 11. Page labels (custom page numbering)
     if "/PageLabels" in pdf.Root:
         del pdf.Root["/PageLabels"]
+
+    # 11b. Bookmarks / outline tree — outline items have titles
+    # that could contain names, account numbers, or other text.
+    if "/Outlines" in pdf.Root:
+        del pdf.Root["/Outlines"]
+    if "/PageMode" in pdf.Root:
+        # /PageMode = UseOutlines pointed at the now-deleted tree
+        del pdf.Root["/PageMode"]
+
+    # 11c. Named destinations (/Dests) and viewer preferences
+    if "/Dests" in pdf.Root:
+        del pdf.Root["/Dests"]
+    if "/ViewerPreferences" in pdf.Root:
+        del pdf.Root["/ViewerPreferences"]
+
+    # 11d. Remaining /Names tree entries (destinations, URIs, etc.)
+    # We already handled /JavaScript and /EmbeddedFiles; clear the rest.
+    if "/Names" in pdf.Root:
+        del pdf.Root["/Names"]
 
     # 12. Page-level cleanup
     for page in pdf.pages:
@@ -102,6 +117,19 @@ def sanitize_metadata(pdf: pikepdf.Pdf) -> None:
         # Per-page actions
         if "/AA" in page:
             del page["/AA"]
+        # All annotations on this page — including widgets, comments,
+        # stamps, sticky notes, free-text annotations, links. Their
+        # appearance streams (/AP) can contain text the main content
+        # stream redaction misses. Redacted text that should have
+        # been destroyed can linger in these appearance streams.
+        if "/Annots" in page:
+            del page["/Annots"]
+        # Tabs entry references structure tree which we're removing
+        if "/Tabs" in page:
+            del page["/Tabs"]
+        # Per-page article threads (/B for Beads)
+        if "/B" in page:
+            del page["/B"]
 
     # 13. XMP metadata on all indirect objects (images, fonts, etc.)
     for obj_id in range(1, len(pdf.objects)):

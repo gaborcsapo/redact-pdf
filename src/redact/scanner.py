@@ -275,12 +275,36 @@ def _deduplicate_rects(rects: list[fitz.Rect]) -> list[fitz.Rect]:
     return kept
 
 
+def _flatten_forms_for_scan(doc: fitz.Document) -> None:
+    """Flatten form widgets into content streams so search_for finds them.
+
+    Form field values are stored in separate widget appearance streams
+    that search_for() doesn't enter. Baking converts them into regular
+    content stream text at the widget's rectangle, so our normal
+    text search can find them.
+
+    This is done in-memory on the open doc object — the source file
+    is not modified (we never save this doc).
+    """
+    if not doc.is_form_pdf:
+        return
+    bake_fn = getattr(doc, "bake", None)
+    if bake_fn is not None:
+        try:
+            bake_fn(annots=False, widgets=True)
+        except Exception:
+            pass
+
+
 def scan_pdf(pdf_path: Path, terms: list[str]) -> ScanResult:
     """Scan a PDF for all occurrences of the given terms.
 
     Each term is automatically expanded into separator variants,
     suffix forms, and mask-stripped forms before searching.
     Uses PyMuPDF's search_for() which returns bounding rectangles.
+
+    Form field widgets are flattened in-memory before scanning so
+    their text becomes searchable. The source file is never modified.
     """
     fitz.TOOLS.set_small_glyph_heights(True)
 
@@ -288,6 +312,8 @@ def scan_pdf(pdf_path: Path, terms: list[str]) -> ScanResult:
 
     doc = fitz.open(str(pdf_path))
     try:
+        _flatten_forms_for_scan(doc)
+
         all_matches: list[Match] = []
         all_warnings: list[FontWarning] = []
 

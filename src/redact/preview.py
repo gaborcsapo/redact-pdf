@@ -25,9 +25,22 @@ def generate_preview(
 
     This does NOT modify the original file. The preview is a separate
     file that the user can open to review what will be redacted.
+
+    Form fields are flattened in the preview so highlights land on
+    the correct positions — matches from the scanner reference the
+    flattened coordinates.
     """
     doc = fitz.open(str(source_pdf))
     try:
+        # Flatten form fields to match the scanner's view of the document
+        if doc.is_form_pdf:
+            bake_fn = getattr(doc, "bake", None)
+            if bake_fn is not None:
+                try:
+                    bake_fn(annots=False, widgets=True)
+                except Exception:
+                    pass
+
         for match in matches:
             page = doc[match.page_number]
             rect = fitz.Rect(match.rect)

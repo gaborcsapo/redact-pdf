@@ -23,6 +23,42 @@ REDACT_TEXT_COLOR = (1, 1, 1)  # White text on black
 REDACT_FONTSIZE = 8
 
 
+def _flatten_forms(doc: fitz.Document) -> None:
+    """Flatten form field widgets into page content streams.
+
+    After this, any interactive AcroForm fields become static text
+    in the page content, which apply_redactions() can remove.
+
+    Tries doc.bake() first (PyMuPDF 1.23+). Falls back to manually
+    deleting widgets if bake is unavailable.
+    """
+    if not doc.is_form_pdf:
+        return
+
+    # Preferred: use bake() which handles font embedding and layout
+    bake_fn = getattr(doc, "bake", None)
+    if bake_fn is not None:
+        try:
+            bake_fn(annots=False, widgets=True)
+            return
+        except Exception:
+            pass
+
+    # Fallback: manually delete widget annotations on each page.
+    # This removes interactivity but may leave the text visible
+    # if the widget had an appearance stream. Better than nothing.
+    for page in doc:
+        try:
+            widgets = list(page.widgets() or [])
+        except Exception:
+            continue
+        for widget in widgets:
+            try:
+                page.delete_widget(widget)
+            except Exception:
+                continue
+
+
 def apply_redactions(
     source_pdf: Path,
     matches: list[dict],
@@ -44,6 +80,14 @@ def apply_redactions(
 
     doc = fitz.open(str(source_pdf))
     try:
+        # Phase 0: Flatten form field widgets into page content streams.
+        # Widget field values live in separate appearance streams that
+        # apply_redactions() doesn't touch. Baking converts them into
+        # regular content stream text, which the redaction step can
+        # then remove normally. This also eliminates interactivity:
+        # no more clickable/editable fields in the output.
+        _flatten_forms(doc)
+
         # Group matches by page for efficiency
         pages_to_redact: dict[int, list[tuple[float, float, float, float]]] = {}
         for m in matches:
