@@ -338,6 +338,100 @@ def _flatten_forms_for_scan(doc: fitz.Document) -> None:
             pass
 
 
+def _extract_xfa_xml(pdf_path: Path) -> str | None:
+    """Extract the concatenated XML text from /AcroForm/XFA if present.
+
+    XFA (XML Forms Architecture) stores form data in XML streams
+    separate from the page content streams. The /XFA entry is either
+    a single stream containing the full XML document, or an array
+    of alternating (name, stream) pairs for each form packet
+    (template, datasets, config, etc.).
+
+    Returns the concatenated decoded XML, or None if no XFA is present.
+    """
+    try:
+        import pikepdf
+    except ImportError:
+        return None
+
+    try:
+        pdf = pikepdf.open(str(pdf_path))
+    except Exception:
+        return None
+
+    try:
+        acroform = pdf.Root.get("/AcroForm")
+        if acroform is None:
+            return None
+        xfa = acroform.get("/XFA")
+        if xfa is None:
+            return None
+
+        chunks: list[str] = []
+
+        def _read_stream(obj) -> str:
+            try:
+                raw = bytes(obj.read_bytes())
+            except Exception:
+                return ""
+            for encoding in ("utf-8", "utf-16", "latin-1"):
+                try:
+                    return raw.decode(encoding, errors="replace")
+                except Exception:
+                    continue
+            return ""
+
+        if isinstance(xfa, pikepdf.Stream):
+            chunks.append(_read_stream(xfa))
+        elif isinstance(xfa, pikepdf.Array):
+            # Array of alternating (name_string, stream_ref) pairs
+            for item in xfa:
+                if isinstance(item, pikepdf.Stream):
+                    chunks.append(_read_stream(item))
+
+        return "\n".join(c for c in chunks if c) or None
+    except Exception:
+        return None
+    finally:
+        try:
+            pdf.close()
+        except Exception:
+            pass
+
+
+def _check_xfa_for_terms(
+    pdf_path: Path,
+    terms: list[str],
+) -> list[FontWarning]:
+    """Scan XFA XML content for search terms.
+
+    XFA forms live in a separate XML stream that PyMuPDF's text search
+    doesn't enter. Extract the XML and search it directly. We return
+    warnings rather than matches because we can't easily compute page
+    rectangles for XFA-only content — the fix is that sanitize deletes
+    /AcroForm/XFA entirely so any matched text is removed at the source.
+    """
+    xml_text = _extract_xfa_xml(pdf_path)
+    if not xml_text:
+        return []
+
+    warnings: list[FontWarning] = []
+    lowered = xml_text.lower()
+    for term in terms:
+        if term.lower() in lowered:
+            warnings.append(FontWarning(
+                page_number=-1,  # XFA spans the whole document
+                font_name="XFA",
+                reason=(
+                    f"Term {term!r} found in XFA form XML data. "
+                    "The XFA stream will be deleted during sanitize, "
+                    "but review the output to confirm no visible "
+                    "text remains."
+                ),
+            ))
+    return warnings
+
+
 def scan_pdf(pdf_path: Path, terms: list[str]) -> ScanResult:
     """Scan a PDF for all occurrences of the given terms.
 
@@ -358,6 +452,11 @@ def scan_pdf(pdf_path: Path, terms: list[str]) -> ScanResult:
 
         all_matches: list[Match] = []
         all_warnings: list[FontWarning] = []
+
+        # Check XFA form XML for terms (separate from page content).
+        # XFA text will be stripped during sanitize, but we report it
+        # so the user knows about it.
+        all_warnings.extend(_check_xfa_for_terms(pdf_path, terms))
 
         for page in doc:
             all_warnings.extend(_check_fonts(page))

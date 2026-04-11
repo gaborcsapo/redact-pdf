@@ -272,27 +272,174 @@ def scrub_form_xobjects(pdf: pikepdf.Pdf, terms: list[str]) -> list[int]:
     return scrubbed
 
 
+def normalize_glyph_positions(pdf: pikepdf.Pdf) -> int:
+    """Strip numeric position adjustments from TJ text arrays.
+
+    Defends against the PETS 2023 glyph positioning attack
+    (Bland et al., "Story Beyond the Eye"), which demonstrated
+    that subpixel per-character horizontal shifts preserved by
+    standard redaction tools leak enough information to
+    deredact surnames with ~1-in-8,000 confidence.
+
+    Concretely: the TJ operator takes an array like
+        [(He) -70 (llo) -30 (wo) 20 (rld)] TJ
+    where the integers are per-character horizontal adjustments
+    in text space units (1/1000 of the font em). After redaction
+    strips characters, the remaining integers still encode the
+    widths of what was removed — revealing the character set.
+
+    This function walks every page's content stream AND every
+    Form XObject's content stream, finds TJ operators, and
+    rewrites them to contain only the string items — dropping
+    all numeric position adjustments. The visible output loses
+    kerning fidelity but is otherwise unchanged, and the
+    side-channel leak is eliminated.
+
+    Returns the number of TJ operators modified.
+    """
+    modified_count = 0
+
+    def _normalize_stream(stream_obj) -> int:
+        """Parse, normalize TJ ops in, and rewrite a content stream."""
+        try:
+            instructions = list(pikepdf.parse_content_stream(stream_obj))
+        except Exception:
+            return 0
+
+        local_modified = 0
+        new_instructions: list = []
+        for operands, operator in instructions:
+            op_str = str(operator)
+            if op_str == "TJ" and operands:
+                # The single operand should be an array of strings
+                # and numeric adjustments. Keep only the strings.
+                arr = operands[0]
+                if isinstance(arr, pikepdf.Array):
+                    had_numbers = any(
+                        not isinstance(item, pikepdf.String)
+                        for item in arr
+                    )
+                    if had_numbers:
+                        filtered = [
+                            item for item in arr
+                            if isinstance(item, pikepdf.String)
+                        ]
+                        new_arr = pikepdf.Array(filtered)
+                        new_instructions.append(([new_arr], operator))
+                        local_modified += 1
+                        continue
+            new_instructions.append((operands, operator))
+
+        if local_modified == 0:
+            return 0
+
+        try:
+            new_content = pikepdf.unparse_content_stream(new_instructions)
+        except Exception:
+            return 0
+
+        try:
+            stream_obj.write(new_content)
+        except Exception:
+            return 0
+
+        return local_modified
+
+    # Normalize page content streams
+    for page in pdf.pages:
+        try:
+            if "/Contents" not in page:
+                continue
+            contents = page["/Contents"]
+            if isinstance(contents, pikepdf.Array):
+                # Multiple content streams: concatenate into one
+                # so parse_content_stream sees the whole thing.
+                # Easier: process each individually.
+                for ref in contents:
+                    stream = pdf.get_object(ref)
+                    if isinstance(stream, pikepdf.Stream):
+                        modified_count += _normalize_stream(stream)
+            elif isinstance(contents, pikepdf.Stream):
+                modified_count += _normalize_stream(contents)
+        except Exception:
+            continue
+
+    # Normalize Form XObject content streams too — TJ arrays can
+    # hide inside these, especially in flattened form templates.
+    form_name = pikepdf.Name("/Form")
+    xobj_name = pikepdf.Name("/XObject")
+    for obj in pdf.objects:
+        try:
+            if not isinstance(obj, pikepdf.Stream):
+                continue
+            if obj.get("/Subtype") != form_name:
+                continue
+            if obj.get("/Type") is not None and obj.get("/Type") != xobj_name:
+                continue
+            modified_count += _normalize_stream(obj)
+        except Exception:
+            continue
+
+    return modified_count
+
+
+def strip_xfa(pdf: pikepdf.Pdf) -> bool:
+    """Delete /AcroForm/XFA explicitly before /AcroForm is removed.
+
+    XFA (XML Forms Architecture) is Adobe's XML-based form system,
+    separate from AcroForm. It stores form data in an XML stream
+    that bake() does not flatten. Even though we delete /AcroForm
+    entirely in sanitize_metadata, we strip /XFA explicitly here
+    so it's obvious in the code and safe against reordering.
+
+    Returns True if XFA data was present and removed.
+    """
+    acroform = pdf.Root.get("/AcroForm")
+    if acroform is None:
+        return False
+    if "/XFA" in acroform:
+        try:
+            del acroform["/XFA"]
+            return True
+        except Exception:
+            return False
+    return False
+
+
 def sanitize_and_rewrite(
     input_path: Path,
     output_path: Path,
     scrub_terms: list[str] | None = None,
-) -> list[int]:
+) -> dict:
     """Open a PDF, strip all metadata, and rewrite cleanly.
 
     Uses QPDF's linearization to force a complete structural rewrite,
     ensuring no orphaned objects or incremental update artifacts survive.
 
     If scrub_terms is provided, also empties Form XObject content
-    streams that contain any of those terms. Returns the list of
-    scrubbed object IDs (empty if none or if scrub_terms is None).
+    streams that contain any of those terms.
+
+    Returns a dict with counts of what was scrubbed:
+        - scrubbed_xobjects: number of Form XObjects emptied
+        - tj_ops_normalized: number of TJ operators with positions stripped
+        - xfa_removed: whether XFA data was explicitly removed
     """
     pdf = pikepdf.open(str(input_path))
     try:
+        # Strip XFA first (explicitly, before /AcroForm is deleted)
+        xfa_removed = strip_xfa(pdf)
+
         sanitize_metadata(pdf)
 
         scrubbed_xobjects: list[int] = []
         if scrub_terms:
             scrubbed_xobjects = scrub_form_xobjects(pdf, scrub_terms)
+
+        # Glyph position normalization (PETS 2023 defense).
+        # Runs after redaction and Form XObject scrubbing so it
+        # cleans up any TJ arrays that still carry positional
+        # side-channel information.
+        tj_ops_normalized = normalize_glyph_positions(pdf)
 
         # Remove unreferenced resources (orphaned objects)
         try:
@@ -308,6 +455,10 @@ def sanitize_and_rewrite(
             linearize=True,
             object_stream_mode=pikepdf.ObjectStreamMode.generate,
         )
-        return scrubbed_xobjects
+        return {
+            "scrubbed_xobjects": scrubbed_xobjects,
+            "tj_ops_normalized": tj_ops_normalized,
+            "xfa_removed": xfa_removed,
+        }
     finally:
         pdf.close()
