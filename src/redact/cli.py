@@ -33,6 +33,7 @@ from redact.manifest import (
     write_manifest,
 )
 from redact.preview import generate_preview
+from redact.rasterize import rasterize_failed_pages
 from redact.redactor import apply_redactions
 from redact.scanner import Match, load_terms, scan_pdf
 from redact.verify import verify_redaction
@@ -234,6 +235,14 @@ def apply_cmd(
             help="Path for the redacted PDF output.",
         ),
     ] = None,
+    rasterize_failed: Annotated[
+        bool,
+        typer.Option(
+            "--rasterize-failed",
+            help="If verification fails, rasterize the failing pages "
+                 "to flat images (nuclear option — kills selectability).",
+        ),
+    ] = False,
 ) -> None:
     """Apply redactions from a manifest file.
 
@@ -273,11 +282,11 @@ def apply_cmd(
         f"Applying [bold]{len(matches)}[/bold] redactions..."
     )
 
-    apply_redactions(source_pdf, matches, output)
+    terms = manifest.get("terms", [])
+    apply_redactions(source_pdf, matches, output, terms=terms)
     _strip_xattrs(output)
 
     # Verification pass
-    terms = manifest.get("terms", [])
     if terms:
         console.print("Running verification...")
         result = verify_redaction(output, terms)
@@ -303,10 +312,37 @@ def apply_cmd(
             )
             for f in result.failures:
                 console.print(f"  [red]• {f}[/red]")
-            console.print(
-                "\n[yellow]The output file may not be fully redacted. "
-                "Review manually before distributing.[/yellow]"
-            )
+
+            if rasterize_failed:
+                console.print(
+                    "\n[yellow]Rasterizing failing pages...[/yellow]"
+                )
+                final_result, rasterized = rasterize_failed_pages(
+                    output, output, terms,
+                )
+                if rasterized:
+                    console.print(
+                        f"Rasterized {len(rasterized)} page(s): "
+                        f"{sorted(rasterized)}"
+                    )
+                if final_result.passed:
+                    console.print(
+                        "[green bold]Verification passed after "
+                        "rasterization.[/green bold]"
+                    )
+                else:
+                    console.print(
+                        "[red bold]Verification still failing after "
+                        "rasterization:[/red bold]"
+                    )
+                    for f in final_result.failures:
+                        console.print(f"  [red]• {f}[/red]")
+            else:
+                console.print(
+                    "\n[yellow]Review manually before distributing, or "
+                    "retry with [bold]--rasterize-failed[/bold] to "
+                    "flatten the failing pages.[/yellow]"
+                )
 
     console.print(f"\nSaved to: [blue bold]{output}[/blue bold]")
 
@@ -453,6 +489,15 @@ def bulk_apply_cmd(
             help="Write detailed errors (with tracebacks) to this file.",
         ),
     ] = None,
+    rasterize_failed: Annotated[
+        bool,
+        typer.Option(
+            "--rasterize-failed",
+            help="For pages that fail verification, replace them with "
+                 "rasterized images (nuclear option — kills "
+                 "selectability on those pages).",
+        ),
+    ] = False,
 ) -> None:
     """Apply redactions for all files in a bulk manifest.
 
@@ -473,7 +518,9 @@ def bulk_apply_cmd(
         f"Applying redactions for [bold]{file_count}[/bold] file(s)...\n"
     )
 
-    results = bulk_apply(manifest, output_dir)
+    results = bulk_apply(
+        manifest, output_dir, rasterize_failed=rasterize_failed,
+    )
 
     # Strip xattrs from all output files
     for r in results:
@@ -516,6 +563,21 @@ def bulk_apply_cmd(
         f"[bold]{skipped}[/bold] skipped, "
         f"[bold]{errors}[/bold] errors"
     )
+
+    # Show rasterization summary if it ran
+    rasterized_files = [r for r in results if r.get("rasterized_pages")]
+    if rasterized_files:
+        total_pages = sum(
+            len(r["rasterized_pages"]) for r in rasterized_files
+        )
+        console.print(
+            f"\n[yellow]Rasterized {total_pages} page(s) across "
+            f"{len(rasterized_files)} file(s) (flattened to images).[/yellow]"
+        )
+        for r in rasterized_files:
+            console.print(
+                f"  {r['source']}: pages {r['rasterized_pages']}"
+            )
 
     if failed_ver > 0:
         console.print(

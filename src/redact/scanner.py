@@ -275,6 +275,48 @@ def _deduplicate_rects(rects: list[fitz.Rect]) -> list[fitz.Rect]:
     return kept
 
 
+def _find_via_text_dict(
+    page_dict: dict,
+    variants: list[str],
+) -> list[fitz.Rect]:
+    """Fallback: use page.get_text('dict') to find term variants.
+
+    When search_for() misses text (due to font encoding quirks,
+    hidden text layers with render mode 3, or unusual CMaps),
+    get_text('dict') may still extract it because it uses a
+    different text extraction pipeline inside PyMuPDF.
+
+    Walks the page's text structure (blocks → lines → spans) and
+    checks each line's concatenated text for any variant. Returns
+    bounding rectangles of matching lines.
+    """
+    rects: list[fitz.Rect] = []
+    lowered_variants = [v.lower() for v in variants if v]
+    if not lowered_variants:
+        return rects
+
+    for block in page_dict.get("blocks", []):
+        if block.get("type") != 0:  # 0 = text block
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+            # Concatenate span texts to reconstruct the line
+            line_text = "".join(s.get("text", "") for s in spans).lower()
+            for variant in lowered_variants:
+                if variant in line_text:
+                    # Use the line bounding box as the match rect.
+                    # This may over-redact a bit (the whole line
+                    # rather than just the matching substring), but
+                    # that's safe and biases toward recall.
+                    bbox = line.get("bbox")
+                    if bbox and len(bbox) == 4:
+                        rects.append(fitz.Rect(*bbox))
+                    break  # one rect per line is enough
+    return rects
+
+
 def _flatten_forms_for_scan(doc: fitz.Document) -> None:
     """Flatten form widgets into content streams so search_for finds them.
 
@@ -324,6 +366,12 @@ def scan_pdf(pdf_path: Path, terms: list[str]) -> ScanResult:
             if img_warning:
                 all_warnings.append(img_warning)
 
+            # Extract structured text once per page for the fallback pass
+            try:
+                page_dict = page.get_text("dict")
+            except Exception:
+                page_dict = None
+
             for original_term, variants in expansion_map.items():
                 found_any = False
                 # Collect all rects found by all variants for this term
@@ -337,6 +385,16 @@ def scan_pdf(pdf_path: Path, terms: list[str]) -> ScanResult:
                 # a larger rect (suffix match inside a full match).
                 # Keep the largest non-overlapping set.
                 deduped = _deduplicate_rects(page_rects)
+
+                # Fallback pass: if search_for found nothing for this
+                # term on this page, check page.get_text("dict") to
+                # catch text that search_for missed due to font
+                # encoding quirks or hidden text layers.
+                if not deduped and page_dict is not None:
+                    fallback_rects = _find_via_text_dict(
+                        page_dict, variants,
+                    )
+                    deduped = _deduplicate_rects(fallback_rects)
 
                 for rect in deduped:
                     all_matches.append(Match(

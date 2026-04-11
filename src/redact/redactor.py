@@ -63,6 +63,7 @@ def apply_redactions(
     source_pdf: Path,
     matches: list[dict],
     output_path: Path,
+    terms: list[str] | None = None,
 ) -> Path:
     """Apply redactions to a PDF and save to output_path.
 
@@ -70,11 +71,18 @@ def apply_redactions(
         source_pdf: Path to the original (unmodified) PDF.
         matches: List of match dicts with "page" and "rect" keys.
         output_path: Where to save the redacted PDF.
+        terms: Optional list of user search terms. If provided,
+            Form XObject content streams containing these terms
+            are emptied during the sanitize phase.
 
     Each match is applied as a black rectangle with "REDACTED" text.
     After PyMuPDF redaction, the file is passed through pikepdf
     for metadata sanitization and a clean structural rewrite.
     """
+    # If terms weren't explicitly passed, derive them from the matches
+    if terms is None:
+        terms = sorted({m["term"] for m in matches if "term" in m})
+
     # Reduce bounding-box overlap issues
     fitz.TOOLS.set_small_glyph_heights(True)
 
@@ -128,9 +136,12 @@ def apply_redactions(
     finally:
         doc.close()
 
-    # Phase 3: Sanitize metadata and rewrite cleanly with pikepdf
+    # Phase 3: Sanitize metadata and rewrite cleanly with pikepdf.
+    # Also scrub Form XObjects for any user terms that leaked through.
     try:
-        sanitize_and_rewrite(intermediate_path, output_path)
+        sanitize_and_rewrite(
+            intermediate_path, output_path, scrub_terms=terms,
+        )
     finally:
         # Clean up intermediate file
         intermediate_path.unlink(missing_ok=True)

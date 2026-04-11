@@ -19,6 +19,7 @@ from pathlib import Path
 
 from redact.manifest import compute_file_hash, create_manifest, write_manifest
 from redact.preview import generate_preview
+from redact.rasterize import rasterize_failed_pages
 from redact.redactor import apply_redactions
 from redact.scanner import Match, ScanResult, load_terms, scan_pdf
 from redact.verify import verify_redaction
@@ -157,8 +158,12 @@ def read_bulk_manifest(manifest_path: Path) -> dict:
 def bulk_apply(
     manifest: dict,
     output_dir: Path,
+    rasterize_failed: bool = False,
 ) -> list[dict]:
     """Apply redactions for all files in a bulk manifest.
+
+    If rasterize_failed is True, pages that fail verification are
+    replaced with rasterized images as a fallback.
 
     Returns a list of result dicts, one per file, with status and
     verification results.
@@ -203,8 +208,12 @@ def bulk_apply(
             continue
 
         # Phase 1: apply redactions
+        terms = file_manifest.get("terms", manifest.get("terms", []))
         try:
-            apply_redactions(source_pdf, file_manifest["matches"], output_path)
+            apply_redactions(
+                source_pdf, file_manifest["matches"], output_path,
+                terms=terms,
+            )
         except Exception as e:
             result_entry["status"] = "error"
             result_entry["phase"] = "redact"
@@ -216,9 +225,24 @@ def bulk_apply(
 
         # Phase 2: verify
         try:
-            terms = file_manifest.get("terms", manifest.get("terms", []))
             if terms:
                 vr = verify_redaction(output_path, terms)
+
+                # Fallback: rasterize failing pages if requested
+                if not vr.passed and rasterize_failed:
+                    try:
+                        vr, rasterized = rasterize_failed_pages(
+                            output_path, output_path, terms,
+                        )
+                        if rasterized:
+                            result_entry["rasterized_pages"] = sorted(
+                                rasterized,
+                            )
+                    except Exception as e:
+                        result_entry["rasterize_error"] = (
+                            f"{type(e).__name__}: {e}"
+                        )
+
                 result_entry["verification"] = "passed" if vr.passed else "FAILED"
                 if not vr.passed:
                     result_entry["verification_failures"] = vr.failures
