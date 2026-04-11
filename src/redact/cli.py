@@ -523,6 +523,27 @@ def bulk_apply_cmd(
             f"Review manually before distributing.[/red bold]"
         )
 
+    # Print detailed verification failures
+    if failed_ver > 0:
+        console.print("\n[red bold]Verification failure details:[/red bold]")
+        for r in results:
+            if r.get("verification") != "FAILED":
+                continue
+            failures = r.get("verification_failures", [])
+            console.print(f"  [red]{r['source']}[/red]")
+            if failures:
+                for f in failures:
+                    console.print(f"    [red]•[/red] {f}")
+            else:
+                console.print(
+                    "    [dim](no failure details captured)[/dim]"
+                )
+        console.print(
+            "\n[dim]Verification failures usually mean the redacted text "
+            "appears in metadata, annotations, font subsets, or text that "
+            "was split across lines. See the README for details.[/dim]"
+        )
+
     # Print detailed error info for each failed file
     if errors > 0:
         console.print("\n[red bold]Error details:[/red bold]")
@@ -551,7 +572,7 @@ def bulk_apply_cmd(
             )
 
     # Write error log file if requested
-    if error_log and errors > 0:
+    if error_log and (errors > 0 or failed_ver > 0):
         _write_error_log(results, error_log)
         console.print(f"\nError log written to: [blue]{error_log}[/blue]")
 
@@ -559,18 +580,22 @@ def bulk_apply_cmd(
 
 
 def _write_error_log(results: list[dict], log_path: Path) -> None:
-    """Write a detailed error log with tracebacks for all failed files."""
+    """Write a detailed error log with tracebacks and verification failures."""
     lines: list[str] = []
-    lines.append(f"Redact bulk apply — error log")
+    lines.append("Redact bulk apply — error log")
     lines.append(f"Generated: {__import__('datetime').datetime.now().isoformat()}")
     lines.append("=" * 70)
     lines.append("")
 
+    # Section 1: Errors (exceptions during processing)
     error_count = 0
     for r in results:
         if r["status"] != "error":
             continue
         error_count += 1
+        if error_count == 1:
+            lines.append("ERRORS")
+            lines.append("-" * 70)
         lines.append(f"[{error_count}] {r['source']}")
         lines.append(f"    Phase:       {r.get('phase', 'unknown')}")
         lines.append(f"    Error type:  {r.get('error_type', 'UnknownError')}")
@@ -579,6 +604,33 @@ def _write_error_log(results: list[dict], log_path: Path) -> None:
             lines.append("    Traceback:")
             for tb_line in r["traceback"].rstrip().splitlines():
                 lines.append(f"      {tb_line}")
+        lines.append("")
+
+    # Section 2: Verification failures
+    ver_count = 0
+    for r in results:
+        if r.get("verification") != "FAILED":
+            continue
+        ver_count += 1
+        if ver_count == 1:
+            lines.append("VERIFICATION FAILURES")
+            lines.append("-" * 70)
+            lines.append(
+                "These files were redacted but post-redaction verification"
+            )
+            lines.append(
+                "found traces of the search terms still present. Review each"
+            )
+            lines.append("file manually before distributing.")
+            lines.append("")
+        lines.append(f"[{ver_count}] {r['source']}")
+        failures = r.get("verification_failures", [])
+        if failures:
+            lines.append("    Failures:")
+            for f in failures:
+                lines.append(f"      - {f}")
+        else:
+            lines.append("    (no failure details captured)")
         lines.append("")
 
     log_path.write_text("\n".join(lines), encoding="utf-8")

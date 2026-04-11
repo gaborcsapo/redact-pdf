@@ -591,3 +591,143 @@ def test_bulk_apply_successful_files_have_no_error_fields(tmp_path: Path):
     for r in done:
         assert "error_type" not in r
         assert "traceback" not in r
+
+
+# --- Verification failure reporting ---
+
+
+def _patched_bulk_apply_with_fake_verification_failure(monkeypatch):
+    """Patch verify_redaction to always report a failure."""
+    from redact import bulk as bulk_module
+    from redact.verify import VerificationResult
+
+    def fake_verify(pdf_path, terms):
+        return VerificationResult(
+            passed=False,
+            text_extraction_clean=True,
+            stream_inspection_clean=False,
+            byte_scan_clean=False,
+            failures=[
+                "Stream inspection: term found in content stream on page 2",
+                "Byte scan: term found in raw file data (utf-8 encoding)",
+            ],
+        )
+
+    monkeypatch.setattr(bulk_module, "verify_redaction", fake_verify)
+
+
+def test_bulk_apply_captures_verification_failures(tmp_path: Path, monkeypatch):
+    """Failures list from verification should land in result dict."""
+    _patched_bulk_apply_with_fake_verification_failure(monkeypatch)
+
+    input_dir, terms_file = _make_input_folder(tmp_path)
+    terms = load_terms(terms_file)
+    drafts_dir = tmp_path / "drafts"
+    manifest_path = tmp_path / "manifest.json"
+    output_dir = tmp_path / "output"
+
+    manifest, _ = bulk_scan(input_dir, terms, drafts_dir, manifest_path)
+    results = bulk_apply(manifest, output_dir)
+
+    failed = [r for r in results if r.get("verification") == "FAILED"]
+    assert len(failed) > 0
+    for r in failed:
+        assert "verification_failures" in r
+        assert len(r["verification_failures"]) == 2
+        assert any("Stream inspection" in f for f in r["verification_failures"])
+        assert any("Byte scan" in f for f in r["verification_failures"])
+
+
+def test_bulk_apply_cli_shows_verification_failure_details(
+    tmp_path: Path, monkeypatch
+):
+    """CLI should display the specific verification failure messages."""
+    # Patch verify_redaction at module level before the CLI imports it
+    from redact import bulk as bulk_module
+    from redact.verify import VerificationResult
+
+    def fake_verify(pdf_path, terms):
+        return VerificationResult(
+            passed=False,
+            text_extraction_clean=True,
+            stream_inspection_clean=True,
+            byte_scan_clean=False,
+            failures=[
+                "Byte scan: term found in raw file data (utf-8 encoding)",
+            ],
+        )
+
+    monkeypatch.setattr(bulk_module, "verify_redaction", fake_verify)
+
+    input_dir, terms_file = _make_input_folder(tmp_path)
+    drafts_dir = tmp_path / "drafts"
+    manifest_path = tmp_path / "manifest.json"
+    output_dir = tmp_path / "output"
+
+    runner.invoke(app, [
+        "bulk", "scan",
+        str(input_dir),
+        "--terms", str(terms_file),
+        "--drafts", str(drafts_dir),
+        "--output", str(manifest_path),
+    ])
+
+    result = runner.invoke(app, [
+        "bulk", "apply",
+        str(manifest_path),
+        "--output", str(output_dir),
+    ])
+
+    # Should show verification failure section
+    assert "Verification failure details" in result.output
+    # Should show the specific failure message
+    assert "Byte scan" in result.output
+    # Should show hint about common causes
+    assert "metadata" in result.output.lower() or "font subset" in result.output.lower()
+
+
+def test_bulk_apply_cli_error_log_includes_verification_failures(
+    tmp_path: Path, monkeypatch
+):
+    """Error log should capture verification failures too, not just exceptions."""
+    from redact import bulk as bulk_module
+    from redact.verify import VerificationResult
+
+    def fake_verify(pdf_path, terms):
+        return VerificationResult(
+            passed=False,
+            text_extraction_clean=True,
+            stream_inspection_clean=False,
+            byte_scan_clean=True,
+            failures=[
+                "Stream inspection: term found in content stream on page 1",
+            ],
+        )
+
+    monkeypatch.setattr(bulk_module, "verify_redaction", fake_verify)
+
+    input_dir, terms_file = _make_input_folder(tmp_path)
+    drafts_dir = tmp_path / "drafts"
+    manifest_path = tmp_path / "manifest.json"
+    output_dir = tmp_path / "output"
+    log_path = tmp_path / "errors.log"
+
+    runner.invoke(app, [
+        "bulk", "scan",
+        str(input_dir),
+        "--terms", str(terms_file),
+        "--drafts", str(drafts_dir),
+        "--output", str(manifest_path),
+    ])
+
+    runner.invoke(app, [
+        "bulk", "apply",
+        str(manifest_path),
+        "--output", str(output_dir),
+        "--error-log", str(log_path),
+    ])
+
+    assert log_path.exists()
+    log_content = log_path.read_text()
+    assert "VERIFICATION FAILURES" in log_content
+    assert "Stream inspection" in log_content
